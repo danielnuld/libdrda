@@ -45,6 +45,19 @@ drda_conn *drda_connect_opts(const char *host, int port, const char *database,
 void drda_close(drda_conn *c);
 
 const char *drda_error(const drda_conn *c);
+
+/* 1 once the connection is unusable: the network failed, the server sent
+ * something unreadable, or drda_cancel cut it. Every later call fails fast;
+ * the only way on is drda_close and a new connection. An SQL error is not a
+ * lost connection. */
+int drda_conn_lost(const drda_conn *c);
+
+/* Stop the statement running on c, from any thread. DRDA has no reliable
+ * way to interrupt a query on the same connection, so this shuts the socket
+ * down: the running call returns an error, the connection is lost and any
+ * open transaction is rolled back by the server. The caller must keep c
+ * alive (not drda_close it) until drda_cancel returns. */
+void drda_cancel(drda_conn *c);
 /* SQLCODE and SQLSTATE of the last statement (0 and "00000" on success). */
 int drda_sqlcode(const drda_conn *c);
 const char *drda_sqlstate(const drda_conn *c);

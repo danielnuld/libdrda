@@ -7,8 +7,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
+#include <pthread.h>
+#include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 static int failures;
+
+/* Cancel c after a second, from another thread. */
+#ifdef _WIN32
+static DWORD WINAPI canceller(LPVOID arg)
+#else
+static void *canceller(void *arg)
+#endif
+{
+    sleep_ms(1000);
+    drda_cancel((drda_conn *)arg);
+    return 0;
+}
+
+static void start_canceller(drda_conn *c)
+{
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, canceller, c, 0, NULL);
+    if (h)
+        CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, canceller, c) == 0)
+        pthread_detach(t);
+#endif
+}
 
 #define CHECK(cond)                                                     \
     do {                                                                \
@@ -255,7 +290,33 @@ int main(void)
 
     CHECK(run(c, "drop table drda_live") == 0);
     CHECK(drda_commit(c) == 0);
+    CHECK(!drda_conn_lost(c)); /* SQL errors along the way did not lose it */
     drda_close(c);
+
+    /* drda_cancel from another thread stops a long query at once and loses
+     * the connection; a new one works. */
+    c = drda_connect(host, port, db, user, pw, err, sizeof err);
+    CHECK(c != NULL);
+    if (c) {
+        time_t t0 = time(NULL);
+        int rc;
+        start_canceller(c);
+        rc = drda_query(c, "select count(*) from syscolumns a, syscolumns b, systables t", &r);
+        if (rc == 0) {
+            rc = drda_next(r) == 1 ? 0 : -1;
+            drda_free(r);
+        }
+        CHECK(rc < 0 && drda_conn_lost(c));
+        CHECK(strstr(drda_error(c), "cancelled") != NULL);
+        CHECK(time(NULL) - t0 < 10);
+        CHECK(drda_query(c, "select 1 from systables", &r) < 0); /* fails fast now */
+        sleep_ms(1500); /* the canceller thread is done with c */
+        drda_close(c);
+        c = drda_connect(host, port, db, user, pw, err, sizeof err);
+        CHECK(c != NULL && strcmp(scalar(c, "select count(*) from systables where tabid = 1"),
+                                  "1") == 0);
+        drda_close(c);
+    }
 
     /* TLS, against a drsocssl listener whose certificate names
      * DRDA_TEST_TLS_HOST (default localhost) and is signed by the PEM in

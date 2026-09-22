@@ -1,0 +1,59 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,   os: ubuntu-latest,  cc: gcc }
+          - { name: linux-clang, os: ubuntu-latest,  cc: clang }
+          - { name: linux-asan,  os: ubuntu-latest,  cc: gcc, san: true }
+          - { name: linux-notls, os: ubuntu-latest,  cc: gcc, notls: true }
+          - { name: macos,       os: macos-latest,   cc: clang }
+          - { name: windows-msvc, os: windows-latest }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: bash
+        run: |
+          args="-DDRDA_WERROR=ON -DCMAKE_BUILD_TYPE=Debug"
+          [ -n "${{ matrix.cc }}" ] && args="$args -DCMAKE_C_COMPILER=${{ matrix.cc }}"
+          [ "${{ matrix.san }}" = "true" ] && args="$args -DCMAKE_C_FLAGS=-fsanitize=address,undefined\ -fno-sanitize-recover=all"
+          [ "${{ matrix.notls }}" = "true" ] && args="$args -DDRDA_WITH_OPENSSL=OFF"
+          [ "${{ runner.os }}" = "macOS" ] && args="$args -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+          [ "${{ runner.os }}" = "Windows" ] && args="$args -DDRDA_WITH_OPENSSL=OFF"
+          eval cmake -S . -B build $args
+      - name: Build
+        run: cmake --build build --config Debug
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+  mingw:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: mingw-x64, sys: MINGW64, env: x86_64 }
+          - { name: mingw-x86, sys: MINGW32, env: i686 }
+    name: ${{ matrix.name }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.sys }}
+          install: >-
+            mingw-w64-${{ matrix.env }}-gcc
+            mingw-w64-${{ matrix.env }}-cmake
+            mingw-w64-${{ matrix.env }}-ninja
+            mingw-w64-${{ matrix.env }}-openssl
+      - run: cmake -S . -B build -G Ninja -DDRDA_WERROR=ON
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure

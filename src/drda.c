@@ -75,6 +75,10 @@ struct drda_conn {
     int sqlcode;
     char sqlstate[6];
     int timeout_ms; /* while connecting; 0 once connected */
+    /* ponytail: plain volatile flags, read and written as whole ints; a C11
+     * atomic would be stricter but MSVC's C mode lacks <stdatomic.h>. */
+    volatile int lost;      /* the stream is unusable (drda_conn_lost) */
+    volatile int cancelled; /* drda_cancel cut it */
     drda_result *open;
     wb in;      /* payload bytes of the current reply chain */
     obj *objs;
@@ -130,8 +134,12 @@ static int send_all(drda_conn *c, const uint8_t *p, size_t n)
         else
 #endif
             k = (int)send(c->s, (const char *)p, chunk, 0);
-        if (k <= 0)
+        if (k <= 0) {
+            c->lost = 1;
+            if (c->cancelled)
+                return fail(c, "the query was cancelled (the connection was closed)");
             return fail(c, "connection lost while sending");
+        }
         p += k;
         n -= (size_t)k;
     }
@@ -150,6 +158,9 @@ static int recv_all(drda_conn *c, uint8_t *p, size_t n)
 #endif
             k = (int)recv(c->s, (char *)p, chunk, 0);
         if (k <= 0) {
+            c->lost = 1;
+            if (c->cancelled)
+                return fail(c, "the query was cancelled (the connection was closed)");
             if (c->timeout_ms)
                 return fail(c, "no answer from the server within %d ms (is the port a %s listener?)",
                             c->timeout_ms, c_tls(c) ? "drsocssl" : "drsoctcp");
@@ -208,7 +219,10 @@ static sock_t dial(const char *host, int port)
 static int send_wb(drda_conn *c, wb *w)
 {
     int rc;
-    if (w->err)
+    if (c->lost)
+        rc = fail(c, c->cancelled ? "the query was cancelled; the connection is closed"
+                                  : "the connection is closed");
+    else if (w->err)
         rc = fail(c, "request too large or out of memory");
     else
         rc = send_all(c, w->p, w->n);
@@ -249,7 +263,22 @@ static int recv_payload(drda_conn *c, size_t n)
 
 /* Read one reply chain: DSS after DSS until one without the chain bit.
  * Every DDM object lands in c->objs, its bytes in c->in. */
+static int read_chain_raw(drda_conn *c);
+
+/* A failure mid-chain leaves the stream out of step, so it loses the
+ * connection whatever the cause. */
 static int read_chain(drda_conn *c)
+{
+    if (c->lost)
+        return fail(c, "the connection is closed");
+    if (read_chain_raw(c) < 0) {
+        c->lost = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int read_chain_raw(drda_conn *c)
 {
     int chained = 1;
     c->in.n = 0;
@@ -691,6 +720,19 @@ void drda_close(drda_conn *c)
 }
 
 const char *drda_error(const drda_conn *c) { return c->err; }
+int drda_conn_lost(const drda_conn *c) { return c->lost; }
+
+void drda_cancel(drda_conn *c)
+{
+    if (!c || c->s == BAD_SOCK)
+        return;
+    c->cancelled = 1;
+#ifdef _WIN32
+    shutdown(c->s, SD_BOTH);
+#else
+    shutdown(c->s, SHUT_RDWR);
+#endif
+}
 int drda_sqlcode(const drda_conn *c) { return c->sqlcode; }
 const char *drda_sqlstate(const drda_conn *c) { return c->sqlstate; }
 

@@ -54,8 +54,9 @@ if(DRDA_BUILD_TESTS)
   add_test(NAME decode COMMAND test_decode)
 
   # Runs against a live server when DRDA_TEST_HOST is set; skips otherwise.
+  find_package(Threads REQUIRED)
   add_executable(test_live tests/test_live.c)
-  target_link_libraries(test_live PRIVATE drda)
+  target_link_libraries(test_live PRIVATE drda Threads::Threads)
   target_compile_options(test_live PRIVATE ${DRDA_WARN})
   add_test(NAME live COMMAND test_live)
   set_tests_properties(live PROPERTIES SKIP_RETURN_CODE 77)
