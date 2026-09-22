@@ -162,6 +162,13 @@ static int recv_all(drda_conn *c, uint8_t *p, size_t n)
             c->lost = 1;
             if (c->cancelled)
                 return fail(c, "the query was cancelled (the connection was closed)");
+            if (c->timeout_ms && k == 0)
+                /* An onsoctcp (SQLI) listener hangs up on the first DRDA
+                   message: the usual mistake is its port, typically 9088. */
+                return fail(c, "the server closed the connection while logging in: is the port "
+                               "a %s (DRDA) listener? The port of the IBM clients' onsoctcp "
+                               "listener, often 9088, does not speak DRDA",
+                            c_tls(c) ? "drsocssl" : "drsoctcp");
             if (c->timeout_ms)
                 return fail(c, "no answer from the server within %d ms (is the port a %s listener?)",
                             c->timeout_ms, c_tls(c) ? "drsocssl" : "drsoctcp");
