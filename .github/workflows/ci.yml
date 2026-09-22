@@ -11,6 +11,7 @@ jobs:
           - { name: linux-clang, os: ubuntu-latest,  cc: clang }
           - { name: linux-asan,  os: ubuntu-latest,  cc: gcc, san: true }
           - { name: linux-notls, os: ubuntu-latest,  cc: gcc, notls: true }
+          - { name: linux-strict-c11, os: ubuntu-latest, cc: gcc, strict: true }
           - { name: macos,       os: macos-latest,   cc: clang }
           - { name: windows-msvc, os: windows-latest }
     name: ${{ matrix.name }}
@@ -24,6 +25,8 @@ jobs:
           [ -n "${{ matrix.cc }}" ] && args="$args -DCMAKE_C_COMPILER=${{ matrix.cc }}"
           [ "${{ matrix.san }}" = "true" ] && args="$args -DCMAKE_C_FLAGS=-fsanitize=address,undefined\ -fno-sanitize-recover=all"
           [ "${{ matrix.notls }}" = "true" ] && args="$args -DDRDA_WITH_OPENSSL=OFF"
+          # Squaero builds libdrda as -std=c11 without GNU extensions.
+          [ "${{ matrix.strict }}" = "true" ] && args="$args -DCMAKE_C_EXTENSIONS=OFF"
           [ "${{ runner.os }}" = "macOS" ] && args="$args -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
           [ "${{ runner.os }}" = "Windows" ] && args="$args -DDRDA_WITH_OPENSSL=OFF"
           eval cmake -S . -B build $args

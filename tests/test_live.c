@@ -2,6 +2,16 @@
  * DRDA_TEST_HOST is set; also reads DRDA_TEST_PORT, DRDA_TEST_DB,
  * DRDA_TEST_USER and DRDA_TEST_PASSWORD. The database must be logged
  * and writable: the test creates and drops table drda_live. */
+/* nanosleep and pthreads are hidden by a strict -std=c11; ask for them. */
+#if !defined(_WIN32)
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#  if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#    define _DARWIN_C_SOURCE
+#  endif
+#endif
+
 #include "drda.h"
 
 #include <stdio.h>
@@ -14,8 +24,13 @@
 static void sleep_ms(int ms) { Sleep((DWORD)ms); }
 #else
 #include <pthread.h>
-#include <unistd.h>
-static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+static void sleep_ms(int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
 #endif
 
 static int failures;

@@ -1,3 +1,14 @@
+/* The POSIX socket API (getaddrinfo, struct timeval...) is hidden by a strict
+ * -std=c11, which is how Squaero builds this; ask for it by name. */
+#if !defined(_WIN32)
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#  if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#    define _DARWIN_C_SOURCE
+#  endif
+#endif
+
 #include "drda.h"
 
 #include "decode.h"
@@ -19,6 +30,7 @@ typedef SOCKET sock_t;
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 typedef int sock_t;
 #define BAD_SOCK (-1)
