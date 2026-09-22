@@ -2,7 +2,8 @@
  * The password comes from DRDA_PASSWORD. Each SQL argument runs in turn,
  * with the values that follow it for its ? markers: -p text, -n NULL,
  * -f the bytes of a file. Rows print tab-separated; the work is committed
- * at the end. */
+ * at the end. DRDA_TLS=require|verify-ca|verify-full turns TLS on, with the
+ * CAs of DRDA_CA_FILE. */
 #include "drda.h"
 
 #include <stdio.h>
@@ -62,7 +63,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: DRDA_PASSWORD=... drdacli host port database user \"sql\" [...]\n");
         return 2;
     }
-    c = drda_connect(argv[1], atoi(argv[2]), argv[3], argv[4], pw, err, sizeof err);
+    {
+        const char *tls = getenv("DRDA_TLS");
+        drda_options o;
+        memset(&o, 0, sizeof o);
+        o.tls = DRDA_TLS_OFF;
+        o.ca_file = getenv("DRDA_CA_FILE");
+        if (tls && strcmp(tls, "require") == 0)
+            o.tls = DRDA_TLS_REQUIRE;
+        else if (tls && strcmp(tls, "verify-ca") == 0)
+            o.tls = DRDA_TLS_VERIFY_CA;
+        else if (tls && strcmp(tls, "verify-full") == 0)
+            o.tls = DRDA_TLS_VERIFY_FULL;
+        else if (tls && *tls) {
+            fprintf(stderr, "DRDA_TLS must be require, verify-ca or verify-full\n");
+            return 2;
+        }
+        c = drda_connect_opts(argv[1], atoi(argv[2]), argv[3], argv[4], pw, &o, err, sizeof err);
+    }
     if (!c) {
         fprintf(stderr, "connect: %s\n", err);
         return 1;

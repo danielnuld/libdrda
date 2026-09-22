@@ -10,14 +10,15 @@ the proprietary SQLI protocol.
 ## Why
 
 The CSDK is closed, 32-bit only on some platforms and unavailable on iOS,
-macOS and many Linux targets. A small, dependency-free client makes Informix
-reachable from anywhere a C compiler runs. The first consumer is
+macOS and many Linux targets. A small client, with OpenSSL as its only (optional) dependency,
+makes Informix reachable from anywhere a C compiler runs. The first consumer is
 [Squaero](https://github.com/danielnuld/squaero).
 
 ## Server requirement
 
 The Informix server must expose a DRDA listener: an `sqlhosts` entry with
-protocol `drsoctcp` (Informix 11.10 or later). Check with `onstat -g ntt`.
+protocol `drsoctcp` (Informix 11.10 or later), or `drsocssl` for TLS. Check
+with `onstat -g ntt`.
 
 ## Status
 
@@ -25,7 +26,10 @@ Proof of concept, verified against Informix 15.0.1 (the
 `icr.io/informix/informix-developer-database` container) and read-only
 against an Informix 11.70.FC7 server:
 
-- Connect, log in with user and password, open a database.
+- Connect, log in with user and password, open a database, over plain TCP or
+  TLS (`drda_connect_opts`: `require`, `verify-ca` or `verify-full`, the
+  modes of PostgreSQL's `sslmode`). Logging in gives up after 30 s by
+  default, so TLS against a plain listener fails instead of hanging.
 - Run any statement. Queries stream through a cursor, block by block, so a
   large result is never held in memory at once. Other statements report the
   rows they affected.
@@ -43,8 +47,10 @@ against an Informix 11.70.FC7 server:
 
 Each one fails with an explicit error, never silently:
 
-- The password travels in clear text (SECMEC 3) and there is no TLS yet. Use
-  it only on a trusted network.
+- Without TLS the password travels in clear text (SECMEC 3): use TLS, or a
+  trusted network. The encrypted SECMEC 9 is not implemented.
+- On Windows, OpenSSL does not read the system certificate store: pass the
+  CA file to verify a certificate.
 - Database code sets: CCSID 819 (Latin-1) and 1208 (UTF-8) only.
 - Non-LOB parameter values up to 32767 bytes each, and up to 84 parameters.
 - Smart large objects (BLOB, CLOB) are untested.
@@ -58,6 +64,10 @@ Quirks of Informix over DRDA, shown as they arrive:
 - DATETIME HOUR TO MINUTE shows seconds, and fractions show six digits.
 
 ## Build
+
+OpenSSL (1.1.1 or later) is found through CMake's `FindOpenSSL`; pass
+`-DOPENSSL_ROOT_DIR=...` if needed, or `-DDRDA_WITH_OPENSSL=OFF` to build
+without TLS, which then refuses every TLS mode.
 
 ```sh
 cmake -S . -B build -G Ninja -DDRDA_WERROR=ON
@@ -78,9 +88,15 @@ sh tests/load_lob_fixture.sh   # TEXT/BYTE rows; skipped when absent
 DRDA_TEST_HOST=127.0.0.1 DRDA_TEST_PORT=19089 ctest --test-dir build
 ```
 
+The TLS part of the live test runs when `DRDA_TEST_TLS_PORT` and
+`DRDA_TEST_CA_FILE` are set, against a `drsocssl` listener whose
+certificate names `DRDA_TEST_TLS_HOST` (default `localhost`);
+`tests/tls_container.sh` sets one up.
+
 `drdacli` runs statements from the command line and prints rows
 tab-separated; it reads the password from `DRDA_PASSWORD`. Values for `?`
 follow each statement: `-p text`, `-n` for NULL, `-f file` for its bytes.
+`DRDA_TLS=require|verify-ca|verify-full` and `DRDA_CA_FILE` turn on TLS.
 
 ## Design rules
 

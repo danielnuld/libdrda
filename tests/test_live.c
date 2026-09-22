@@ -257,6 +257,67 @@ int main(void)
     CHECK(drda_commit(c) == 0);
     drda_close(c);
 
+    /* TLS, against a drsocssl listener whose certificate names
+     * DRDA_TEST_TLS_HOST (default localhost) and is signed by the PEM in
+     * DRDA_TEST_CA_FILE. Only its sysmaster database is used. */
+    if (getenv("DRDA_TEST_TLS_PORT") && getenv("DRDA_TEST_CA_FILE")) {
+        int tport = atoi(getenv("DRDA_TEST_TLS_PORT"));
+        const char *thost = env("DRDA_TEST_TLS_HOST", "localhost");
+        drda_options o;
+        drda_param p;
+        memset(&o, 0, sizeof o);
+        o.tls = DRDA_TLS_VERIFY_FULL;
+        o.ca_file = getenv("DRDA_TEST_CA_FILE");
+        c = drda_connect_opts(thost, tport, "sysmaster", user, pw, &o, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            /* Many blocks, so TLS records split rows and DSS headers. */
+            CHECK(drda_query(c, "select tabname, colname from syscolumns c, systables t "
+                                "where c.tabid = t.tabid", &r) == 0);
+            n = 0;
+            while (drda_next(r) == 1)
+                n++;
+            drda_free(r);
+            CHECK(n > 500 && atoi(scalar(c, "select count(*) from syscolumns c, systables t "
+                                            "where c.tabid = t.tabid")) == n);
+            p.data = "systables";
+            p.len = 9;
+            CHECK(drda_query_params(c, "select tabid from systables where tabname = ?", &p, 1,
+                                    &r) == 0);
+            CHECK(drda_next(r) == 1 && strcmp(drda_text(r, 0), "1") == 0);
+            drda_free(r);
+            drda_close(c);
+        } else {
+            fprintf(stderr, "  TLS connect: %s\n", err);
+        }
+
+        /* The certificate is for the host name, not for the address. */
+        CHECK(drda_connect_opts("127.0.0.1", tport, "sysmaster", user, pw, &o, err, sizeof err) ==
+              NULL);
+        CHECK(strstr(err, "mismatch") != NULL);
+        o.tls = DRDA_TLS_VERIFY_CA;
+        c = drda_connect_opts("127.0.0.1", tport, "sysmaster", user, pw, &o, err, sizeof err);
+        CHECK(c != NULL);
+        drda_close(c);
+
+        /* Without the CA the self-signed certificate is not trusted, unless
+         * only encryption was asked for. */
+        o.ca_file = NULL;
+        CHECK(drda_connect_opts(thost, tport, "sysmaster", user, pw, &o, err, sizeof err) == NULL);
+        CHECK(strstr(err, "certificate") != NULL);
+        o.tls = DRDA_TLS_REQUIRE;
+        c = drda_connect_opts(thost, tport, "sysmaster", user, pw, &o, err, sizeof err);
+        CHECK(c != NULL);
+        drda_close(c);
+
+        /* TLS against a plain listener ends at the timeout, with a hint. */
+        o.connect_timeout_ms = 2000;
+        CHECK(drda_connect_opts(host, port, db, user, pw, &o, err, sizeof err) == NULL);
+        CHECK(strstr(err, "drsocssl") != NULL);
+    } else {
+        printf("DRDA_TEST_TLS_PORT/DRDA_TEST_CA_FILE not set, skipping TLS\n");
+    }
+
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

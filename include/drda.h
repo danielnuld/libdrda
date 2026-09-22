@@ -15,12 +15,33 @@ typedef struct drda_conn drda_conn;
 typedef struct drda_result drda_result;
 
 /* Open a connection to a DRDA listener (an sqlhosts entry of protocol
- * drsoctcp) and log in with user and password, sent in clear text: use it
- * on a trusted network until TLS lands. Returns NULL and fills err (if
- * given) on failure. */
+ * drsoctcp) and log in with user and password. Without TLS the password
+ * travels in clear text: use drda_connect_opts on an untrusted network.
+ * Returns NULL and fills err (if given) on failure. */
 drda_conn *drda_connect(const char *host, int port, const char *database,
                         const char *user, const char *password,
                         char *err, int errlen);
+
+typedef enum {
+    DRDA_TLS_OFF = 0,     /* plain TCP */
+    DRDA_TLS_REQUIRE,     /* encrypted, the server's certificate not checked */
+    DRDA_TLS_VERIFY_CA,   /* encrypted, certificate signed by a trusted CA */
+    DRDA_TLS_VERIFY_FULL, /* and issued for the host name or IP connected to */
+} drda_tls_mode;
+
+typedef struct {
+    drda_tls_mode tls;
+    const char *ca_file; /* PEM of the CAs to trust; NULL = OpenSSL's default
+                          * paths (Windows has none: pass a file there) */
+    int connect_timeout_ms; /* for each wait while logging in; 0 = 30000.
+                             * Queries run without a timeout. */
+} drda_options; /* zero it before filling it in */
+
+/* drda_connect with options. For TLS the listener must be of protocol
+ * drsocssl. A library built without OpenSSL refuses any TLS mode. */
+drda_conn *drda_connect_opts(const char *host, int port, const char *database,
+                             const char *user, const char *password,
+                             const drda_options *opts, char *err, int errlen);
 void drda_close(drda_conn *c);
 
 const char *drda_error(const drda_conn *c);

@@ -25,6 +25,12 @@ typedef int sock_t;
 #define sock_close close
 #endif
 
+#ifdef DRDA_HAVE_OPENSSL
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
+
 /* DDM code points. */
 enum {
     EXCSAT = 0x1041, ACCSEC = 0x106D, SECCHK = 0x106E, ACCRDB = 0x2001,
@@ -58,12 +64,17 @@ typedef struct {
 
 struct drda_conn {
     sock_t s;
+#ifdef DRDA_HAVE_OPENSSL
+    SSL_CTX *ctx;
+    SSL *ssl; /* NULL on a plain connection */
+#endif
     int le;
     int ccsid;
     char rdbnam[19];
     char err[512];
     int sqlcode;
     char sqlstate[6];
+    int timeout_ms; /* while connecting; 0 once connected */
     drda_result *open;
     wb in;      /* payload bytes of the current reply chain */
     obj *objs;
@@ -98,10 +109,27 @@ static int fail(drda_conn *c, const char *fmt, ...)
 
 /* ---- socket -------------------------------------------------------- */
 
+static int c_tls(const drda_conn *c)
+{
+#ifdef DRDA_HAVE_OPENSSL
+    return c->ssl != NULL;
+#else
+    (void)c;
+    return 0;
+#endif
+}
+
 static int send_all(drda_conn *c, const uint8_t *p, size_t n)
 {
     while (n) {
-        int k = (int)send(c->s, (const char *)p, (int)(n > 0x10000 ? 0x10000 : n), 0);
+        int chunk = (int)(n > 0x10000 ? 0x10000 : n);
+        int k;
+#ifdef DRDA_HAVE_OPENSSL
+        if (c->ssl)
+            k = SSL_write(c->ssl, p, chunk);
+        else
+#endif
+            k = (int)send(c->s, (const char *)p, chunk, 0);
         if (k <= 0)
             return fail(c, "connection lost while sending");
         p += k;
@@ -113,13 +141,38 @@ static int send_all(drda_conn *c, const uint8_t *p, size_t n)
 static int recv_all(drda_conn *c, uint8_t *p, size_t n)
 {
     while (n) {
-        int k = (int)recv(c->s, (char *)p, (int)(n > 0x10000 ? 0x10000 : n), 0);
-        if (k <= 0)
+        int chunk = (int)(n > 0x10000 ? 0x10000 : n);
+        int k;
+#ifdef DRDA_HAVE_OPENSSL
+        if (c->ssl)
+            k = SSL_read(c->ssl, p, chunk);
+        else
+#endif
+            k = (int)recv(c->s, (char *)p, chunk, 0);
+        if (k <= 0) {
+            if (c->timeout_ms)
+                return fail(c, "no answer from the server within %d ms (is the port a %s listener?)",
+                            c->timeout_ms, c_tls(c) ? "drsocssl" : "drsoctcp");
             return fail(c, "connection closed by the server");
+        }
         p += k;
         n -= (size_t)k;
     }
     return 0;
+}
+
+/* Receive and send timeout in milliseconds, 0 = none. */
+static void set_timeout(sock_t s, int ms)
+{
+#ifdef _WIN32
+    DWORD t = (DWORD)ms;
+#else
+    struct timeval t;
+    t.tv_sec = ms / 1000;
+    t.tv_usec = (ms % 1000) * 1000;
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof t);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof t);
 }
 
 static sock_t dial(const char *host, int port)
@@ -404,12 +457,76 @@ static void pkgnamcsn(wb *w, const drda_conn *c)
     ddm_bytes(w, PKGNAMCSN, b, 64);
 }
 
+#ifdef DRDA_HAVE_OPENSSL
+static int tls_fail(drda_conn *c, const char *what)
+{
+    unsigned long e = ERR_get_error();
+    long v = c->ssl ? SSL_get_verify_result(c->ssl) : X509_V_OK;
+    char buf[256];
+    if (v != X509_V_OK)
+        return fail(c, "%s: server certificate rejected: %s", what,
+                    X509_verify_cert_error_string(v));
+    if (e) {
+        ERR_error_string_n(e, buf, sizeof buf);
+        return fail(c, "%s: %s", what, buf);
+    }
+    return fail(c, "%s failed (is the port a drsocssl listener?)", what);
+}
+
+static int is_ip(const char *host)
+{
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_flags = AI_NUMERICHOST;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0)
+        return 0;
+    freeaddrinfo(res);
+    return 1;
+}
+
+static int tls_start(drda_conn *c, const char *host, const drda_options *o)
+{
+    c->ctx = SSL_CTX_new(TLS_client_method());
+    if (!c->ctx)
+        return tls_fail(c, "TLS setup");
+    SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+    if (o->tls >= DRDA_TLS_VERIFY_CA) {
+        int ok = o->ca_file ? SSL_CTX_load_verify_locations(c->ctx, o->ca_file, NULL)
+                            : SSL_CTX_set_default_verify_paths(c->ctx);
+        if (ok != 1)
+            return fail(c, "cannot load the CA file %s", o->ca_file ? o->ca_file : "(default)");
+        SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER, NULL);
+    }
+    c->ssl = SSL_new(c->ctx);
+    if (!c->ssl || SSL_set_fd(c->ssl, (int)c->s) != 1)
+        return tls_fail(c, "TLS setup");
+    if (!is_ip(host))
+        SSL_set_tlsext_host_name(c->ssl, host);
+    if (o->tls == DRDA_TLS_VERIFY_FULL) {
+        int ok = is_ip(host) ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(c->ssl), host)
+                             : SSL_set1_host(c->ssl, host);
+        if (ok != 1)
+            return tls_fail(c, "TLS setup");
+    }
+    if (SSL_connect(c->ssl) != 1)
+        return tls_fail(c, "TLS handshake");
+    return 0;
+}
+#endif
+
 drda_conn *drda_connect(const char *host, int port, const char *database,
                         const char *user, const char *password, char *err, int errlen)
 {
+    return drda_connect_opts(host, port, database, user, password, NULL, err, errlen);
+}
+
+drda_conn *drda_connect_opts(const char *host, int port, const char *database,
+                             const char *user, const char *password,
+                             const drda_options *opts, char *err, int errlen)
+{
     drda_conn *c = (drda_conn *)calloc(1, sizeof *c);
     wb w;
-    int i, bad = 0, secmec_ok = 0;
+    int i, bad = 0, secmec_ok = 0, timeout_ms;
     uint8_t typdef[9];
 #ifdef _WIN32
     WSADATA wsa;
@@ -435,6 +552,20 @@ drda_conn *drda_connect(const char *host, int port, const char *database,
     if (c->s == BAD_SOCK) {
         fail(c, "cannot connect to %s:%d", host, port);
         goto out;
+    }
+    /* Bound the handshake: TLS against a plain listener (or the reverse)
+     * would otherwise leave both sides waiting forever. */
+    timeout_ms = opts && opts->connect_timeout_ms > 0 ? opts->connect_timeout_ms : 30000;
+    set_timeout(c->s, timeout_ms);
+    c->timeout_ms = timeout_ms;
+    if (opts && opts->tls != DRDA_TLS_OFF) {
+#ifdef DRDA_HAVE_OPENSSL
+        if (tls_start(c, host, opts) < 0)
+            goto out;
+#else
+        fail(c, "TLS requested but libdrda was built without OpenSSL");
+        goto out;
+#endif
     }
 
     /* 1. Exchange server attributes and ask for user/password security. */
@@ -526,6 +657,8 @@ drda_conn *drda_connect(const char *host, int port, const char *database,
         fail(c, "database code set CCSID %d is not supported yet", c->ccsid);
         goto out;
     }
+    set_timeout(c->s, 0); /* a long query must not time out */
+    c->timeout_ms = 0;
     return c;
 
 out:
@@ -541,6 +674,12 @@ void drda_close(drda_conn *c)
         return;
     if (c->open)
         drda_free(c->open);
+#ifdef DRDA_HAVE_OPENSSL
+    if (c->ssl)
+        SSL_free(c->ssl);
+    if (c->ctx)
+        SSL_CTX_free(c->ctx);
+#endif
     if (c->s != BAD_SOCK)
         sock_close(c->s);
 #ifdef _WIN32
