@@ -42,7 +42,7 @@ enum {
     PRDID = 0x112E, TYPDEFNAM = 0x002F, TYPDEFOVR = 0x0035, CCSIDSBC = 0x119C,
     CCSIDDBC = 0x119D, CCSIDMBC = 0x119E, PKGNAMCSN = 0x2113, RTNSQLDA = 0x2116,
     RDBCMTOK = 0x2105, QRYBLKSZ = 0x2114, MAXBLKEXT = 0x2141, QRYCLSIMP = 0x215D,
-    QRYINSID = 0x215B, SRVDGN = 0x1153,
+    QRYINSID = 0x215B, SRVDGN = 0x1153, RTNEXTDTA = 0x2148,
 };
 
 #define SECMEC_USRIDPWD 3
@@ -79,6 +79,9 @@ struct drda_result {
     int ended;
     wb cells;
     size_t *off;
+    uint64_t *lobn; /* large object lengths of the current row, if any */
+    wb ext;         /* EXTDTA bodies not consumed yet: [be32 len][bytes]... */
+    size_t ext_pos;
     int have_row;
     long long affected;
 };
@@ -566,7 +569,11 @@ static int absorb(drda_result *r)
             r->ended = 1;
             break;
         case EXTDTA:
-            return fail(c, "large object columns are not supported yet");
+            wb_be32(&r->ext, (uint32_t)body.n);
+            wb_put(&r->ext, body.p, body.n);
+            if (r->ext.err)
+                return fail(c, "out of memory");
+            break;
         case SQLCARD: {
             sqlca ca;
             if (decode_sqlca(&body, c->le, &ca) < 0)
@@ -605,6 +612,7 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
     r->c = c;
     wb_init(&r->data);
     wb_init(&r->cells);
+    wb_init(&r->ext);
 
     /* Prepare, asking for the column descriptions. */
     wb_init(&w);
@@ -681,7 +689,8 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
         }
     }
     r->off = (size_t *)calloc((size_t)r->ncols, sizeof *r->off);
-    if (!r->off) {
+    r->lobn = (uint64_t *)calloc((size_t)r->ncols, sizeof *r->lobn);
+    if (!r->off || !r->lobn) {
         fail(c, "out of memory");
         goto fail;
     }
@@ -718,10 +727,36 @@ static int cntqry(drda_result *r)
     pkgnamcsn(&w, c);
     ddm_u32(&w, QRYBLKSZ, BLOCK_SIZE);
     ddm_u64(&w, QRYINSID, r->qryinsid);
+    ddm_u8(&w, RTNEXTDTA, 0x02); /* large objects of every row in the block */
     dss_end(&w);
     if (send_wb(c, &w) < 0 || read_chain(c) < 0)
         return -1;
     return absorb(r);
+}
+
+/* Fill the large object cells of the row just decoded from the EXTDTA
+ * queue, which the server sends in column order, one per non-null value. */
+static int take_lobs(drda_result *r)
+{
+    int i;
+    for (i = 0; i < r->ncols; i++) {
+        rd q, ext;
+        uint32_t n;
+        if (r->off[i] != LOB_PENDING)
+            continue;
+        q = rd_make(r->ext.p + r->ext_pos, r->ext.n - r->ext_pos);
+        n = rd_be32(&q);
+        ext = rd_sub(&q, n);
+        if (ext.err)
+            return fail(r->c, "large object data missing for column \"%s\"", r->cols[i].name);
+        r->ext_pos += 4 + n;
+        r->off[i] = r->cells.n;
+        if (decode_lob(&ext, &r->cols[i], r->lobn[i], &r->cells) < 0)
+            return fail(r->c, "large object data out of step for column \"%s\"",
+                        r->cols[i].name);
+        wb_u8(&r->cells, 0);
+    }
+    return r->cells.err ? fail(r->c, "out of memory") : 0;
 }
 
 int drda_next(drda_result *r)
@@ -736,9 +771,11 @@ int drda_next(drda_result *r)
         size_t before = in.n;
         int rc;
         r->cells.n = 0;
-        rc = decode_row(&in, c->le, r->cols, r->ncols, &r->cells, r->off, &ca);
+        rc = decode_row(&in, c->le, r->cols, r->ncols, &r->cells, r->off, r->lobn, &ca);
         r->pos += before - in.n;
         if (rc == 1) {
+            if (take_lobs(r) < 0)
+                return -1;
             r->have_row = 1;
             return 1;
         }
@@ -759,6 +796,8 @@ int drda_next(drda_result *r)
             memmove(r->data.p, r->data.p + r->pos, r->data.n - r->pos);
         r->data.n -= r->pos;
         r->pos = 0;
+        if (r->ext_pos == r->ext.n)
+            r->ext.n = r->ext_pos = 0;
         before = r->data.n;
         if (cntqry(r) < 0)
             return -1;
@@ -796,6 +835,8 @@ void drda_free(drda_result *r)
     free_cols(r->cols, r->ncols);
     wb_free(&r->data);
     wb_free(&r->cells);
+    wb_free(&r->ext);
+    free(r->lobn);
     free(r->off);
     free(r);
 }

@@ -134,6 +134,39 @@ int main(void)
     drda_free(r);
     CHECK(strcmp(scalar(c, "select id from drda_live"), "3") == 0);
 
+    /* TEXT and BYTE, from the fixture of tests/load_lob_fixture.sh. */
+    if (drda_query(c, "select id, tx, by, n from drda_lob order by id", &r) < 0) {
+        printf("no drda_lob table (tests/load_lob_fixture.sh), skipping TEXT/BYTE\n");
+    } else {
+        size_t k;
+        int ok = 1;
+        CHECK(drda_next(r) == 1);
+        CHECK(drda_text(r, 1) == NULL && drda_text(r, 2) == NULL);
+        CHECK(strcmp(drda_text(r, 3), "1") == 0);
+        CHECK(drda_next(r) == 1);
+        CHECK(strcmp(drda_text(r, 1), "Año ñandú") == 0);
+        CHECK(strcmp(drda_text(r, 2), "0001feff") == 0);
+        CHECK(drda_next(r) == 1);
+        /* 40000 characters and 20000 bytes: several DSS segments each. */
+        CHECK(strlen(drda_text(r, 1)) == 40000 && strlen(drda_text(r, 2)) == 40000);
+        for (k = 0; ok && k < 40000; k++)
+            ok = drda_text(r, 1)[k] == "abcdefghij"[k % 10];
+        for (k = 0; ok && k < 20000; k++) {
+            char hx[3];
+            snprintf(hx, sizeof hx, "%02x", (unsigned)(k % 256));
+            ok = memcmp(drda_text(r, 2) + 2 * k, hx, 2) == 0;
+        }
+        CHECK(ok);
+        CHECK(strcmp(drda_text(r, 3), "3") == 0);
+        CHECK(drda_next(r) == 0);
+        drda_free(r);
+        /* Abandoned after the first row: the cursor closes cleanly. */
+        CHECK(drda_query(c, "select tx from drda_lob order by id desc", &r) == 0);
+        CHECK(drda_next(r) == 1 && strlen(drda_text(r, 0)) == 40000);
+        drda_free(r);
+        CHECK(strcmp(scalar(c, "select count(*) from drda_lob"), "3") == 0);
+    }
+
     CHECK(drda_query(c, "select 1 from drda_live where name = '\xff'", &r) < 0);
     CHECK(strstr(drda_error(c), "UTF-8") != NULL);
 

@@ -187,19 +187,19 @@ static void test_query(void)
     CHECK(decode_qrydsc(&r, cols, ncols) == 0);
     CHECK(cols[0].fdtype == 0x02 && cols[0].fdlen == 4);
     CHECK(cols[1].fdtype == 0x33 && cols[1].fdlen == 128);
-    CHECK(fd_supported(0x33) && !fd_supported(0xC9));
+    CHECK(fd_supported(0x33) && !fd_supported(0x09));
 
     n = unhex(DTA, b);
     wb_init(&cells);
     r = rd_make(b, n);
-    rc = decode_row(&r, 1, cols, ncols, &cells, off, &ca);
+    rc = decode_row(&r, 1, cols, ncols, &cells, off, NULL, &ca);
     CHECK(rc == 1);
     CHECK(strcmp((char *)cells.p + off[0], "1") == 0);
     CHECK(strcmp((char *)cells.p + off[1], "systables") == 0);
     cells.n = 0;
-    CHECK(decode_row(&r, 1, cols, ncols, &cells, off, &ca) == 1);
+    CHECK(decode_row(&r, 1, cols, ncols, &cells, off, NULL, &ca) == 1);
     CHECK(strcmp((char *)cells.p + off[1], "syscolumns") == 0);
-    CHECK(r.n == 0 && decode_row(&r, 1, cols, ncols, &cells, off, &ca) == 0);
+    CHECK(r.n == 0 && decode_row(&r, 1, cols, ncols, &cells, off, NULL, &ca) == 0);
 
     /* A row cut anywhere is "incomplete" and leaves the reader untouched. */
     {
@@ -207,7 +207,7 @@ static void test_query(void)
         for (cut = 1; cut < 18; cut++) {
             rd t = rd_make(b, cut);
             cells.n = 0;
-            CHECK(decode_row(&t, 1, cols, ncols, &cells, off, &ca) == 0);
+            CHECK(decode_row(&t, 1, cols, ncols, &cells, off, NULL, &ca) == 0);
             CHECK(t.n == cut && cells.n == 0);
         }
     }
@@ -241,7 +241,7 @@ static const char *one(uint8_t fdtype, uint16_t fdlen, const char *hex, int ccsi
     n = 2 + unhex(hex, b + 2);
     wb_init(&cells);
     r = rd_make(b, n);
-    if (decode_row(&r, 1, &col, 1, &cells, off, &ca) != 1)
+    if (decode_row(&r, 1, &col, 1, &cells, off, NULL, &ca) != 1)
         snprintf(out, sizeof out, "<error>");
     else if (off[0] == (size_t)-1)
         snprintf(out, sizeof out, "<null>");
@@ -271,6 +271,56 @@ static void test_values(void)
     CHECK(strcmp(one(0x23, 8, "0031332e34352e3030", 0), "13:45:00") == 0);
     CHECK(strcmp(one(0x29, 10, "000002beef", 0), "beef") == 0);
     CHECK(strcmp(one(0xBF, 1, "0001", 0), "t") == 0);
+}
+
+/* select id, tx, by, n from lob where id = 3: TEXT and BYTE travel as a
+ * 4-byte length in the row and their bytes in one EXTDTA each. */
+static void test_lob(void)
+{
+    uint8_t b[128];
+    size_t n, off[4];
+    uint64_t lobn[4];
+    dcol cols[4];
+    sqlca ca;
+    wb cells;
+    rd r, ext;
+
+    memset(cols, 0, sizeof cols);
+    cols[0].fdtype = 0x03; cols[0].fdlen = 4;
+    cols[1].fdtype = 0xCB; cols[1].fdlen = 0x8004; cols[1].ccsid = 819;
+    cols[2].fdtype = 0xC9; cols[2].fdlen = 0x8004;
+    cols[3].fdtype = 0x03; cols[3].fdlen = 4;
+    CHECK(fd_is_lob(0xCB) && fd_is_lob(0xC9) && fd_supported(0xC9) && !fd_is_lob(0x33));
+
+    wb_init(&cells);
+    n = unhex("ff000003000000001000000000040000000009000000", b);
+    r = rd_make(b, n);
+    CHECK(decode_row(&r, 1, cols, 4, &cells, off, lobn, &ca) == 1);
+    CHECK(off[1] == LOB_PENDING && lobn[1] == 16);
+    CHECK(off[2] == LOB_PENDING && lobn[2] == 4);
+    CHECK(strcmp((char *)cells.p + off[3], "9") == 0);
+    r = rd_make(b, n);
+    CHECK(decode_row(&r, 1, cols, 4, &cells, off, NULL, &ca) == -1); /* nowhere for lengths */
+
+    cells.n = 0;
+    n = unhex("0041f16f20f1616e64fa2c20746578746f", b);
+    ext = rd_make(b, n);
+    CHECK(decode_lob(&ext, &cols[1], 16, &cells) == 0);
+    wb_u8(&cells, 0);
+    CHECK(strcmp((char *)cells.p, "A\xc3\xb1o \xc3\xb1" "and\xc3\xba, texto") == 0);
+
+    cells.n = 0;
+    n = unhex("000001feff", b);
+    ext = rd_make(b, n);
+    CHECK(decode_lob(&ext, &cols[2], 4, &cells) == 0);
+    wb_u8(&cells, 0);
+    CHECK(strcmp((char *)cells.p, "0001feff") == 0);
+
+    ext = rd_make(b, n);
+    CHECK(decode_lob(&ext, &cols[2], 5, &cells) < 0); /* length out of step */
+    ext = rd_make(b, 0);
+    CHECK(decode_lob(&ext, &cols[2], 0, &cells) < 0); /* no status byte */
+    wb_free(&cells);
 }
 
 /* Garbage in must never read out of bounds: run under a sanitizer. Seeds
@@ -312,8 +362,19 @@ static void test_garbage(void)
             cols[3].fdtype = 0x25; cols[3].fdlen = b[2];
             wb_init(&cells);
             r = rd_make(b, len);
-            while (decode_row(&r, 1, cols, 4, &cells, off, &ca) == 1)
+            while (decode_row(&r, 1, cols, 4, &cells, off, NULL, &ca) == 1)
                 cells.n = 0;
+            {
+                uint64_t lobn[4];
+                cols[2].fdtype = 0xCB; cols[2].fdlen = 0x8004;
+                r = rd_make(b, len);
+                while (decode_row(&r, 1, cols, 4, &cells, off, lobn, &ca) == 1) {
+                    rd e = rd_make(b, len);
+                    if (off[2] == LOB_PENDING)
+                        decode_lob(&e, &cols[2], lobn[2], &cells);
+                    cells.n = 0;
+                }
+            }
             wb_free(&cells);
         }
     }
@@ -327,6 +388,7 @@ int main(void)
     test_sqlca();
     test_query();
     test_values();
+    test_lob();
     test_garbage();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

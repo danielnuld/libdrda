@@ -22,7 +22,8 @@ protocol `drsoctcp` (Informix 11.10 or later). Check with `onstat -g ntt`.
 ## Status
 
 Proof of concept, verified against Informix 15.0.1 (the
-`icr.io/informix/informix-developer-database` container):
+`icr.io/informix/informix-developer-database` container) and read-only
+against an Informix 11.70.FC7 server:
 
 - Connect, log in with user and password, open a database.
 - Run any statement. Queries stream through a cursor, block by block, so a
@@ -30,8 +31,8 @@ Proof of concept, verified against Informix 15.0.1 (the
   rows they affected.
 - Commit and rollback.
 - Types: SMALLINT, INTEGER, BIGINT, INT8, SERIAL, FLOAT, SMALLFLOAT, DECIMAL,
-  MONEY, CHAR, VARCHAR, LVARCHAR, NCHAR, NVARCHAR, DATE, DATETIME and NULL.
-  Values come back as UTF-8 text.
+  MONEY, CHAR, VARCHAR, LVARCHAR, NCHAR, NVARCHAR, DATE, DATETIME, TEXT,
+  BYTE and NULL. Values come back as UTF-8 text; BYTE as hexadecimal.
 - Errors carry the Informix SQLCODE, SQLSTATE and message tokens (the
   server sends no message text over DRDA).
 
@@ -42,9 +43,11 @@ Each one fails with an explicit error, never silently:
 - The password travels in clear text (SECMEC 3) and there is no TLS yet. Use
   it only on a trusted network.
 - Database code sets: CCSID 819 (Latin-1) and 1208 (UTF-8) only.
-- No TEXT, BYTE, BLOB or CLOB columns, no `?` parameters.
+- No `?` parameters, so TEXT and BYTE can be read but not written (Informix
+  takes them only through host variables).
+- Smart large objects (BLOB, CLOB) are untested.
 - Database names up to 18 characters, SQL text up to 32 KB.
-- Not tested yet against Informix 11.70 or 12.10.
+- Not tested yet against Informix 12.10, nor writes against 11.70.
 
 Quirks of Informix over DRDA, shown as they arrive:
 
@@ -68,6 +71,7 @@ docker run -d --name libdrda-ifx -h ifx -e LICENSE=accept \
   -p 19088:9088 -p 19089:9089 icr.io/informix/informix-developer-database
 DRDA_PASSWORD=in4mix ./build/drdacli 127.0.0.1 19089 sysmaster informix \
   "create database drdatest with log"
+sh tests/load_lob_fixture.sh   # TEXT/BYTE rows; skipped when absent
 DRDA_TEST_HOST=127.0.0.1 DRDA_TEST_PORT=19089 ctest --test-dir build
 ```
 

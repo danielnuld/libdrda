@@ -275,8 +275,14 @@ int fd_supported(uint8_t t)
     case 0xBF:                                  /* boolean */
         return 1;
     default:
-        return 0;
+        return fd_is_lob(t);
     }
+}
+
+int fd_is_lob(uint8_t t)
+{
+    t |= 1;
+    return t == 0xC9 || t == 0xCB || t == 0xCF; /* bytes, single-byte and mixed char */
 }
 
 static void put_str(wb *w, const char *s) { wb_put(w, s, strlen(s)); }
@@ -430,7 +436,23 @@ static int decode_cell(rd *r, int le, const dcol *c, wb *w)
     return 0;
 }
 
-int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *off, sqlca *ca)
+int decode_lob(rd *ext, const dcol *c, uint64_t len, wb *cells)
+{
+    const uint8_t *p;
+    if (c->fdtype & 1)
+        rd_u8(ext); /* status byte of a nullable large object */
+    if (ext->err || ext->n != len)
+        return -1;
+    p = rd_take(ext, ext->n);
+    if ((c->fdtype | 1) == 0xC9) {
+        put_hex(cells, p, (size_t)len);
+        return 0;
+    }
+    return append_utf8(cells, p, (size_t)len, c->ccsid);
+}
+
+int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *off,
+               uint64_t *lobn, sqlca *ca)
 {
     rd save = *r;
     size_t start = cells->n;
@@ -459,6 +481,17 @@ int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *of
     for (i = 0; i < ncols; i++) {
         if ((cols[i].fdtype & 1) && rd_u8(r) >= 0x80) {
             off[i] = (size_t)-1;
+            continue;
+        }
+        if (fd_is_lob(cols[i].fdtype)) {
+            /* The row holds only the length; the bytes follow in EXTDTA. */
+            uint64_t n = (uint64_t)rd_signed(r, cols[i].fdlen & 0x7FFF, le);
+            if (r->err)
+                goto incomplete;
+            if (!lobn)
+                return -1;
+            lobn[i] = n;
+            off[i] = LOB_PENDING;
             continue;
         }
         off[i] = cells->n;

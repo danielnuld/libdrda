@@ -35,11 +35,22 @@ int decode_qrydsc(rd *r, dcol *cols, int ncols);
 /* Whether a row of this FD:OCA type can be rendered. */
 int fd_supported(uint8_t fdtype);
 
+/* Large objects (TEXT, BYTE) travel outside the row, in EXTDTA objects. */
+int fd_is_lob(uint8_t fdtype);
+#define LOB_PENDING ((size_t)-2)
+
 /* One row. `cells` receives NUL-terminated UTF-8 texts; off[i] is the
- * offset of column i in cells->p, or (size_t)-1 for SQL NULL.
+ * offset of column i in cells->p, (size_t)-1 for SQL NULL, or LOB_PENDING
+ * for a large object whose byte length is lobn[i] (lobn may be NULL when no
+ * column is a large object).
  * Returns 1 = row, 0 = incomplete (r is left untouched), 2 = end of data,
  * -1 = error (ca filled when the server reported one, else malformed). */
-int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *off, sqlca *ca);
+int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *off,
+               uint64_t *lobn, sqlca *ca);
+
+/* Render the EXTDTA body of a large object of column c. -1 if its length
+ * does not match the row's placeholder or the text cannot be converted. */
+int decode_lob(rd *ext, const dcol *c, uint64_t len, wb *cells);
 
 /* Convert server text in `ccsid` to UTF-8, appended to w. -1 if the CCSID
  * is not supported. 0 means "no CCSID" and is treated as UTF-8. */
