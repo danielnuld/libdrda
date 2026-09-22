@@ -29,6 +29,9 @@ against an Informix 11.70.FC7 server:
 - Run any statement. Queries stream through a cursor, block by block, so a
   large result is never held in memory at once. Other statements report the
   rows they affected.
+- `?` parameters (`drda_query_params`): values travel as text and the server
+  converts them to the column type; TEXT and BYTE of any size are sent as
+  large objects.
 - Commit and rollback.
 - Types: SMALLINT, INTEGER, BIGINT, INT8, SERIAL, FLOAT, SMALLFLOAT, DECIMAL,
   MONEY, CHAR, VARCHAR, LVARCHAR, NCHAR, NVARCHAR, DATE, DATETIME, TEXT,
@@ -43,10 +46,10 @@ Each one fails with an explicit error, never silently:
 - The password travels in clear text (SECMEC 3) and there is no TLS yet. Use
   it only on a trusted network.
 - Database code sets: CCSID 819 (Latin-1) and 1208 (UTF-8) only.
-- No `?` parameters, so TEXT and BYTE can be read but not written (Informix
-  takes them only through host variables).
+- Non-LOB parameter values up to 32767 bytes each, and up to 84 parameters.
 - Smart large objects (BLOB, CLOB) are untested.
-- Database names up to 18 characters, SQL text up to 32 KB.
+- Database names up to 18 characters, SQL text up to 32000 bytes (Informix
+  rejects a segmented SQL text; only large objects may span segments).
 - Not tested yet against Informix 12.10, nor writes against 11.70.
 
 Quirks of Informix over DRDA, shown as they arrive:
@@ -76,7 +79,8 @@ DRDA_TEST_HOST=127.0.0.1 DRDA_TEST_PORT=19089 ctest --test-dir build
 ```
 
 `drdacli` runs statements from the command line and prints rows
-tab-separated; it reads the password from `DRDA_PASSWORD`.
+tab-separated; it reads the password from `DRDA_PASSWORD`. Values for `?`
+follow each statement: `-p text`, `-n` for NULL, `-f file` for its bytes.
 
 ## Design rules
 

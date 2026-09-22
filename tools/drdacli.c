@@ -1,10 +1,32 @@
-/* drdacli host port database user "sql" [...]
- * The password comes from DRDA_PASSWORD. Each SQL argument runs in turn and
- * its rows print tab-separated; the work is committed at the end. */
+/* drdacli host port database user "sql" [-p value | -n | -f file]... [...]
+ * The password comes from DRDA_PASSWORD. Each SQL argument runs in turn,
+ * with the values that follow it for its ? markers: -p text, -n NULL,
+ * -f the bytes of a file. Rows print tab-separated; the work is committed
+ * at the end. */
 #include "drda.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+static void *slurp(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    char *buf = NULL;
+    long n;
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+        buf = (char *)malloc((size_t)n + 1);
+        if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+            free(buf);
+            buf = NULL;
+        }
+        *len = (size_t)n;
+    }
+    fclose(f);
+    return buf;
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -47,8 +69,37 @@ int main(int argc, char **argv)
     }
     for (i = 5; i < argc && rc == 0; i++) {
         drda_result *r;
-        int k, n, rows = 0;
-        if (drda_query(c, argv[i], &r) < 0) {
+        drda_param params[64];
+        void *files[64];
+        int k, n, rows = 0, np = 0, nf = 0, qrc;
+        const char *sql = argv[i];
+        while (i + 1 < argc && np < 64 && argv[i + 1][0] == '-') {
+            const char *opt = argv[++i];
+            if (strcmp(opt, "-n") == 0) {
+                params[np].data = NULL;
+                params[np++].len = 0;
+            } else if ((strcmp(opt, "-p") == 0 || strcmp(opt, "-f") == 0) && i + 1 < argc) {
+                const char *v = argv[++i];
+                if (opt[1] == 'p') {
+                    params[np].data = v;
+                    params[np++].len = strlen(v);
+                } else if ((files[nf] = slurp(v, &params[np].len)) != NULL) {
+                    params[np++].data = files[nf++];
+                } else {
+                    fprintf(stderr, "cannot read %s\n", v);
+                    rc = 2;
+                }
+            } else {
+                fprintf(stderr, "unknown option %s\n", opt);
+                rc = 2;
+            }
+        }
+        if (rc)
+            break;
+        qrc = drda_query_params(c, sql, params, np, &r);
+        while (nf)
+            free(files[--nf]);
+        if (qrc < 0) {
             fprintf(stderr, "error: %s\n", drda_error(c));
             rc = 1;
             break;

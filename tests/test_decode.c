@@ -82,6 +82,83 @@ static void test_framing(void)
     dss_end(&w);
     CHECK(w.err); /* over one segment: refused, not truncated */
     wb_free(&w);
+
+    /* A large EXTDTA spans segments; stripping their headers gives back
+     * LL 0x8004 (streamed), the code point and the data. */
+    {
+        static uint8_t big[70000], flat[80000];
+        size_t k, at, fn = 0;
+        for (k = 0; k < sizeof big; k++)
+            big[k] = (uint8_t)(k * 31);
+        wb_init(&w);
+        dss_begin(&w, DSS_OBJ, 1, 0x146C);
+        wb_put(&w, big, sizeof big);
+        dss_end(&w);
+        CHECK(!w.err && w.p[0] == 0xFF && w.p[1] == 0xFF);
+        CHECK(w.p[6] == 0x80 && w.p[7] == 0x04 && w.p[8] == 0x14 && w.p[9] == 0x6C);
+        memcpy(flat, w.p + 6, 0x7FFF - 6);
+        fn = 0x7FFF - 6;
+        for (at = 0x7FFF; at < w.n;) {
+            size_t len = (size_t)((w.p[at] << 8 | w.p[at + 1]) & 0x7FFF) - 2;
+            int more = (w.p[at] & 0x80) != 0;
+            CHECK(at + 2 + len <= w.n);
+            memcpy(flat + fn, w.p + at + 2, len);
+            fn += len;
+            at += 2 + len;
+            CHECK(more == (at < w.n));
+        }
+        CHECK(fn == 4 + sizeof big && memcmp(flat + 4, big, sizeof big) == 0);
+        wb_free(&w);
+    }
+}
+
+/* ---- parameters ---------------------------------------------------- */
+
+static void test_params(void)
+{
+    dcol pd[3];
+    const void *data[3];
+    size_t len[3];
+    wb w, ext;
+    int bad;
+    static const uint8_t want[] = {
+        0x00, 0x16, 0x00, 0x10,                         /* FDODSC, 22 bytes */
+        0x0C, 0x76, 0xD0, 0x3F, 0x7F, 0xFF, 0xC9, 0x80, 0x04, 0x3F, 0x7F, 0xFF,
+        0x06, 0x71, 0xE4, 0xD0, 0x00, 0x01,             /* row layout */
+        0x00, 0x11, 0x14, 0x7A,                         /* FDODTA, 17 bytes */
+        0x00,                                           /* group present */
+        0x00, 0x00, 0x03, 'a', 0xC3, 0xB1,              /* "añ" */
+        0x00, 0x02, 0x00, 0x00, 0x00,                   /* BYTE, length 2 LE */
+        0xFF,                                           /* NULL */
+    };
+    memset(pd, 0, sizeof pd);
+    pd[0].sqltype = 449; /* VARCHAR */
+    pd[1].sqltype = 405; /* BLOB (Informix BYTE) */
+    pd[2].sqltype = 497;
+    data[0] = "a\xc3\xb1";
+    len[0] = 3;
+    data[1] = "\x01\x02";
+    len[1] = 2;
+    data[2] = NULL;
+    len[2] = 0;
+    wb_init(&w);
+    wb_init(&ext);
+    CHECK(encode_sqldta(&w, pd, data, len, 3, &ext, &bad) == 0);
+    CHECK(w.n == sizeof want && memcmp(w.p, want, sizeof want) == 0);
+    /* The BYTE value waits in ext: [len][status 0x00][bytes]. */
+    CHECK(ext.n == 4 + 3 && ext.p[3] == 3 && ext.p[4] == 0x00 && ext.p[5] == 1 && ext.p[6] == 2);
+    wb_free(&w);
+    wb_free(&ext);
+
+    data[0] = "\xff"; /* not UTF-8 for a text column */
+    len[0] = 1;
+    wb_init(&w);
+    wb_init(&ext);
+    CHECK(encode_sqldta(&w, pd, data, len, 3, &ext, &bad) < 0 && bad == 0);
+    wb_free(&w);
+    wb_free(&ext);
+    CHECK(sqltype_is_lob(409) && sqltype_is_lob(404) && !sqltype_is_lob(449));
+    CHECK(sqltype_is_blob(405) && !sqltype_is_blob(409));
 }
 
 /* ---- text ---------------------------------------------------------- */
@@ -389,6 +466,7 @@ int main(void)
     test_query();
     test_values();
     test_lob();
+    test_params();
     test_garbage();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

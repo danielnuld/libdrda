@@ -436,6 +436,97 @@ static int decode_cell(rd *r, int le, const dcol *c, wb *w)
     return 0;
 }
 
+/* ---- parameters ---------------------------------------------------- */
+
+int sqltype_is_lob(int t)
+{
+    t &= ~1;
+    return t == 404 || t == 408 || t == 412; /* BLOB, CLOB, DBCLOB */
+}
+
+int sqltype_is_blob(int t) { return (t & ~1) == 404; }
+
+#define FD_NVARMIX 0x3F /* nullable varying mixed-byte text */
+#define FD_NLOBBYTES 0xC9
+#define FD_NLOBCHAR 0xCB
+#define MAX_VARCHAR 0x7FFF
+
+int encode_sqldta(wb *w, const dcol *pd, const void *const *data, const size_t *len, int n,
+                  wb *ext, int *bad)
+{
+    wb d;
+    int i;
+    *bad = -1;
+    /* FDODSC: one nullable group of n fields, then the row layout. */
+    if (3 + 3 * (size_t)n > 255)
+        return -1; /* ponytail: one triplet, so at most 84 parameters */
+    wb_be16(w, (uint16_t)(4 + 3 + 3 * n + 6));
+    wb_be16(w, 0x0010);
+    wb_u8(w, (uint8_t)(3 + 3 * n));
+    wb_u8(w, 0x76);
+    wb_u8(w, 0xD0);
+    for (i = 0; i < n; i++) {
+        if (sqltype_is_lob(pd[i].sqltype)) {
+            wb_u8(w, sqltype_is_blob(pd[i].sqltype) ? FD_NLOBBYTES : FD_NLOBCHAR);
+            wb_be16(w, 0x8004); /* the value is a 4-byte length */
+        } else {
+            wb_u8(w, FD_NVARMIX);
+            wb_be16(w, MAX_VARCHAR);
+        }
+    }
+    {
+        static const uint8_t rlo[] = {0x06, 0x71, 0xE4, 0xD0, 0x00, 0x01};
+        wb_put(w, rlo, sizeof rlo);
+    }
+
+    /* FDODTA: the group's null indicator, then each field. */
+    wb_init(&d);
+    wb_u8(&d, 0x00);
+    for (i = 0; i < n; i++) {
+        const uint8_t *p = (const uint8_t *)data[i];
+        if (!p) {
+            wb_u8(&d, 0xFF);
+            continue;
+        }
+        wb_u8(&d, 0x00);
+        if (sqltype_is_lob(pd[i].sqltype)) {
+            uint8_t l[4];
+            if (len[i] > 0xFFFFFFFEu || (!sqltype_is_blob(pd[i].sqltype) && !utf8_valid(p, len[i]))) {
+                *bad = i;
+                wb_free(&d);
+                return -1;
+            }
+            l[0] = (uint8_t)len[i];
+            l[1] = (uint8_t)(len[i] >> 8);
+            l[2] = (uint8_t)(len[i] >> 16);
+            l[3] = (uint8_t)(len[i] >> 24);
+            wb_put(&d, l, 4);
+            wb_be32(ext, (uint32_t)(len[i] + 1));
+            wb_u8(ext, 0x00); /* status byte of a nullable large object */
+            wb_put(ext, p, len[i]);
+        } else {
+            if (len[i] > MAX_VARCHAR || !utf8_valid(p, len[i])) {
+                *bad = i;
+                wb_free(&d);
+                return -1;
+            }
+            wb_be16(&d, (uint16_t)len[i]);
+            wb_put(&d, p, len[i]);
+        }
+    }
+    /* ponytail: FDODTA in one plain object, so all non-LOB values together
+     * stay under 32 KB; extended lengths would lift it. */
+    if (d.err || ext->err || d.n + 4 > 0x7FFF) {
+        wb_free(&d);
+        return -1;
+    }
+    wb_be16(w, (uint16_t)(d.n + 4));
+    wb_be16(w, 0x147A);
+    wb_put(w, d.p, d.n);
+    wb_free(&d);
+    return w->err ? -1 : 0;
+}
+
 int decode_lob(rd *ext, const dcol *c, uint64_t len, wb *cells)
 {
     const uint8_t *p;

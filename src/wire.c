@@ -162,22 +162,61 @@ void dss_begin(wb *w, int type, uint16_t corr, uint16_t cp)
     wb_be16(w, cp);
 }
 
+#define SEG_MAX 0x7FFF
+#define EXTDTA_CP 0x146C
+
 void dss_end(wb *w)
 {
-    size_t len;
+    size_t start, obj, len, at;
     if (w->err)
         return;
-    len = w->n - w->last_dss;
-    /* ponytail: one segment only, so a request object is capped at 32 KB
-     * (a very long SQL text). Continuation segments lift it if needed. */
-    if (len > 0x7FFF) {
-        w->err = 1;
+    start = w->last_dss;
+    obj = w->n - start - 6;
+    if (obj > SEG_MAX) {
+        /* Only a large object may span DSS segments: 0x8004 marks it
+         * streamed, its data running to the end of the DSS. Informix takes
+         * extended length bytes here as data (a BYTE came back 4 bytes
+         * longer), and rejects any other segmented object with SYNTAXRM
+         * (measured on 15.0.1). */
+        if ((w->p[start + 8] << 8 | w->p[start + 9]) != EXTDTA_CP) {
+            w->err = 1;
+            return;
+        }
+        w->p[start + 6] = 0x80;
+        w->p[start + 7] = 0x04;
+    } else {
+        w->p[start + 6] = (uint8_t)(obj >> 8);
+        w->p[start + 7] = (uint8_t)obj;
+    }
+    len = w->n - start;
+    if (len <= SEG_MAX) {
+        w->p[start] = (uint8_t)(len >> 8);
+        w->p[start + 1] = (uint8_t)len;
         return;
     }
-    w->p[w->last_dss] = (uint8_t)(len >> 8);
-    w->p[w->last_dss + 1] = (uint8_t)len;
-    w->p[w->last_dss + 6] = (uint8_t)((len - 6) >> 8);
-    w->p[w->last_dss + 7] = (uint8_t)(len - 6);
+    /* Continuation: the first segment is full and flagged, each later one
+     * starts with its own 2-byte length, flagged while more follow. */
+    w->p[start] = 0xFF;
+    w->p[start + 1] = 0xFF;
+    {
+        size_t tail = len - SEG_MAX;
+        uint8_t *rest = (uint8_t *)malloc(tail);
+        if (!rest) {
+            w->err = 1;
+            return;
+        }
+        memcpy(rest, w->p + start + SEG_MAX, tail);
+        w->n = start + SEG_MAX;
+        for (at = 0; at < tail;) {
+            size_t chunk = tail - at;
+            if (chunk > SEG_MAX - 2)
+                chunk = SEG_MAX - 2;
+            wb_be16(w, (uint16_t)((chunk + 2) | (at + chunk < tail ? 0x8000 : 0)));
+            wb_put(w, rest + at, chunk);
+            at += chunk;
+        }
+        free(rest);
+    }
 }
 
 void ddm_bytes(wb *w, uint16_t cp, const void *p, size_t n)

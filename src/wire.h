@@ -52,7 +52,8 @@ enum { DSS_RQS = 1, DSS_RPY = 2, DSS_OBJ = 3 };
  * DSS, if any, gets its chain bit (and same-correlator bit when `corr`
  * matches) so a request is simply a sequence of dss_begin/dss_end calls. */
 void dss_begin(wb *w, int type, uint16_t corr, uint16_t cp);
-/* Patch the lengths. Fails (err) when the object exceeds one DSS segment. */
+/* Patch the lengths. A large object (EXTDTA) over 32 KB is split into
+ * continuation segments; any other object that big sets err. */
 void dss_end(wb *w);
 
 /* DDM parameters inside the current object. */

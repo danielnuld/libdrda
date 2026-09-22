@@ -52,6 +52,19 @@ int decode_row(rd *r, int le, const dcol *cols, int ncols, wb *cells, size_t *of
  * does not match the row's placeholder or the text cannot be converted. */
 int decode_lob(rd *ext, const dcol *c, uint64_t len, wb *cells);
 
+/* Whether a parameter of this SQLTYPE (from the input SQLDA) is a large
+ * object, and a binary one. */
+int sqltype_is_lob(int sqltype);
+int sqltype_is_blob(int sqltype);
+
+/* Build the SQLDTA body for parameter values p[0..n) described by pd (the
+ * input SQLDA). Large object bytes go to `ext` as a sequence of
+ * [be32 len][EXTDTA body], to be sent after the SQLDTA in the same order.
+ * Integers in our declared byte order (QTDSQLX86, little-endian).
+ * Returns 0, or -1 with the index of the offending parameter in *bad. */
+int encode_sqldta(wb *w, const dcol *pd, const void *const *data, const size_t *len, int n,
+                  wb *ext, int *bad);
+
 /* Convert server text in `ccsid` to UTF-8, appended to w. -1 if the CCSID
  * is not supported. 0 means "no CCSID" and is treated as UTF-8. */
 int ccsid_supported(int ccsid);

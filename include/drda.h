@@ -5,6 +5,8 @@
 #ifndef DRDA_H
 #define DRDA_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +32,20 @@ const char *drda_sqlstate(const drda_conn *c);
  * columns to fetch; any other runs to completion and reports
  * drda_rows_affected(). Only one result may be open per connection. */
 int drda_query(drda_conn *c, const char *sql, drda_result **out);
+
+/* A value for a `?` marker. data NULL = SQL NULL. Text is UTF-8 and the
+ * server converts it to the column type (numbers, dates in the server's
+ * format); for BYTE and BLOB, data holds the raw bytes. */
+typedef struct {
+    const void *data;
+    size_t len;
+} drda_param;
+
+/* drda_query with values for the statement's `?` markers, in order. The
+ * count must match the markers. Large objects (TEXT, BYTE) of any size
+ * are sent as such; other values are limited to 32767 bytes. */
+int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, int nparams,
+                      drda_result **out);
 
 int drda_col_count(const drda_result *r);
 const char *drda_col_name(const drda_result *r, int col);

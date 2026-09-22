@@ -43,6 +43,7 @@ enum {
     CCSIDDBC = 0x119D, CCSIDMBC = 0x119E, PKGNAMCSN = 0x2113, RTNSQLDA = 0x2116,
     RDBCMTOK = 0x2105, QRYBLKSZ = 0x2114, MAXBLKEXT = 0x2141, QRYCLSIMP = 0x215D,
     QRYINSID = 0x215B, SRVDGN = 0x1153, RTNEXTDTA = 0x2148,
+    DSCSQLSTT = 0x2008, TYPSQLDA = 0x2146, SQLDTA = 0x2412,
 };
 
 #define SECMEC_USRIDPWD 3
@@ -51,7 +52,7 @@ enum {
 #define MAX_REPLY (64u << 20) /* refuse a reply chain larger than this */
 
 typedef struct {
-    uint16_t cp;
+    uint16_t cp, corr;
     size_t off, len;
 } obj;
 
@@ -162,7 +163,7 @@ static int send_wb(drda_conn *c, wb *w)
     return rc;
 }
 
-static int add_obj(drda_conn *c, uint16_t cp, size_t off, size_t len)
+static int add_obj(drda_conn *c, uint16_t cp, uint16_t corr, size_t off, size_t len)
 {
     if (c->nobj == c->capobj) {
         int cap = c->capobj ? c->capobj * 2 : 16;
@@ -173,6 +174,7 @@ static int add_obj(drda_conn *c, uint16_t cp, size_t off, size_t len)
         c->capobj = cap;
     }
     c->objs[c->nobj].cp = cp;
+    c->objs[c->nobj].corr = corr;
     c->objs[c->nobj].off = off;
     c->objs[c->nobj].len = len;
     c->nobj++;
@@ -248,7 +250,7 @@ static int read_chain(drda_conn *c)
             }
             if (r.err || dlen > r.n)
                 return fail(c, "truncated reply object");
-            if (add_obj(c, cp, (size_t)(r.p - c->in.p), dlen) < 0)
+            if (add_obj(c, cp, (uint16_t)(h[4] << 8 | h[5]), (size_t)(r.p - c->in.p), dlen) < 0)
                 return -1;
             rd_take(&r, dlen);
         }
@@ -370,6 +372,15 @@ static int check_obj(drda_conn *c, int i)
         int sev = rd_be16(&v);
         if (sev >= 8) {
             const char *name = rm_name(cp);
+            int k;
+            /* An SQLCARD later in the chain says what went wrong in SQL
+             * terms; prefer it to the bare reply message. */
+            for (k = i + 1; k < c->nobj; k++) {
+                sqlca ca;
+                rd b = obj_rd(c, k);
+                if (c->objs[k].cp == SQLCARD && decode_sqlca(&b, c->le, &ca) > 0 && ca.sqlcode < 0)
+                    return apply_sqlca(c, &ca);
+            }
             if (name)
                 return fail(c, "server error: %s, severity %d", name, sev);
             return fail(c, "server error: reply 0x%04X, severity %d", cp, sev);
@@ -592,10 +603,65 @@ static int absorb(drda_result *r)
     return 0;
 }
 
+/* Append the parameter values: SQLDTA, then one EXTDTA per large object,
+ * all on correlator 1 after the command that uses them. */
+static int put_params(drda_conn *c, wb *w, const dcol *pd, const drda_param *params, int n)
+{
+    const void **data;
+    size_t *len;
+    wb ext;
+    int i, bad, rc;
+    if (n == 0)
+        return 0;
+    data = (const void **)calloc((size_t)n, sizeof *data);
+    len = (size_t *)calloc((size_t)n, sizeof *len);
+    if (!data || !len) {
+        free(data);
+        free(len);
+        return fail(c, "out of memory");
+    }
+    for (i = 0; i < n; i++) {
+        data[i] = params[i].data;
+        len[i] = params[i].len;
+    }
+    wb_init(&ext);
+    dss_begin(w, DSS_OBJ, 1, SQLDTA);
+    rc = encode_sqldta(w, pd, data, len, n, &ext, &bad);
+    dss_end(w);
+    free(data);
+    free(len);
+    if (rc < 0) {
+        wb_free(&ext);
+        if (bad >= 0)
+            return fail(c, "parameter %d is too long or not valid UTF-8 for its column", bad + 1);
+        return fail(c, "too many parameters or parameter values too large together");
+    }
+    {
+        rd q = rd_make(ext.p, ext.n);
+        while (q.n) {
+            uint32_t k = rd_be32(&q);
+            const uint8_t *b = rd_take(&q, k);
+            dss_begin(w, DSS_OBJ, 1, EXTDTA);
+            wb_put(w, b, k);
+            dss_end(w);
+        }
+    }
+    wb_free(&ext);
+    return w->err ? fail(c, "out of memory") : 0;
+}
+
 int drda_query(drda_conn *c, const char *sql, drda_result **out)
+{
+    return drda_query_params(c, sql, NULL, 0, out);
+}
+
+int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, int nparams,
+                      drda_result **out)
 {
     drda_result *r;
     size_t n = strlen(sql);
+    dcol *pd = NULL;
+    int npd = 0;
     wb w;
     int i;
     *out = NULL;
@@ -606,7 +672,11 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
         return fail(c, "another result is still open on this connection");
     if (!utf8_valid((const uint8_t *)sql, n))
         return fail(c, "the SQL text is not valid UTF-8");
-    r =(drda_result *)calloc(1, sizeof *r);
+    if (n > 32000) /* its object must fit one DSS segment */
+        return fail(c, "SQL text over 32000 bytes is not supported over DRDA");
+    if (nparams < 0 || (nparams > 0 && !params))
+        return fail(c, "invalid parameter list");
+    r = (drda_result *)calloc(1, sizeof *r);
     if (!r)
         return fail(c, "out of memory");
     r->c = c;
@@ -614,7 +684,8 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
     wb_init(&r->cells);
     wb_init(&r->ext);
 
-    /* Prepare, asking for the column descriptions. */
+    /* Prepare, asking for the column descriptions, and for the parameter
+     * descriptions too when there are values to send. */
     wb_init(&w);
     dss_begin(&w, DSS_RQS, 1, PRPSQLSTT);
     pkgnamcsn(&w, c);
@@ -626,14 +697,22 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
     wb_put(&w, sql, n);
     wb_u8(&w, 0xFF);
     dss_end(&w);
+    if (nparams > 0) {
+        dss_begin(&w, DSS_RQS, 2, DSCSQLSTT);
+        pkgnamcsn(&w, c);
+        ddm_u8(&w, TYPSQLDA, 1); /* input */
+        dss_end(&w);
+    }
     if (send_wb(c, &w) < 0 || read_chain(c) < 0)
         goto fail;
     for (i = 0; i < c->nobj; i++) {
         rd body = obj_rd(c, i);
         if (c->objs[i].cp == SQLDARD) {
             sqlca ca;
-            if (decode_sqldard(&body, c->le, c->ccsid, &ca, &r->cols, &r->ncols) < 0) {
-                fail(c, "malformed column description (SQLDARD)");
+            int input = c->objs[i].corr == 2;
+            if (decode_sqldard(&body, c->le, c->ccsid, &ca, input ? &pd : &r->cols,
+                               input ? &npd : &r->ncols) < 0) {
+                fail(c, "malformed %s description (SQLDARD)", input ? "parameter" : "column");
                 goto fail;
             }
             if (apply_sqlca(c, &ca) < 0)
@@ -641,6 +720,11 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
         } else if (check_obj(c, i) < 0) {
             goto fail;
         }
+    }
+    if (npd != nparams) {
+        fail(c, "the statement has %d parameter marker(s) but %d value(s) were given", npd,
+             nparams);
+        goto fail;
     }
 
     wb_init(&w);
@@ -650,6 +734,10 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
         pkgnamcsn(&w, c);
         ddm_u8(&w, RDBCMTOK, 0xF1);
         dss_end(&w);
+        if (put_params(c, &w, pd, params, nparams) < 0) {
+            wb_free(&w);
+            goto fail;
+        }
         if (send_wb(c, &w) < 0 || read_chain(c) < 0)
             goto fail;
         for (i = 0; i < c->nobj; i++) {
@@ -668,6 +756,7 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
             }
         }
         r->ended = 1;
+        free_cols(pd, npd);
         *out = r;
         return 0;
     }
@@ -679,6 +768,10 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
     ddm_u16(&w, MAXBLKEXT, 0);
     ddm_u8(&w, QRYCLSIMP, 0x01);
     dss_end(&w);
+    if (put_params(c, &w, pd, params, nparams) < 0) {
+        wb_free(&w);
+        goto fail;
+    }
     if (send_wb(c, &w) < 0 || read_chain(c) < 0 || absorb(r) < 0)
         goto fail;
     for (i = 0; i < r->ncols; i++) {
@@ -694,11 +787,13 @@ int drda_query(drda_conn *c, const char *sql, drda_result **out)
         fail(c, "out of memory");
         goto fail;
     }
+    free_cols(pd, npd);
     c->open = r;
     *out = r;
     return 0;
 
 fail:
+    free_cols(pd, npd);
     c->open = r; /* let drda_free close the cursor if it got opened */
     drda_free(r);
     return -1;
@@ -744,6 +839,12 @@ static int take_lobs(drda_result *r)
         uint32_t n;
         if (r->off[i] != LOB_PENDING)
             continue;
+        if (r->lobn[i] == 0) {
+            /* An empty large object comes with no EXTDTA at all. */
+            r->off[i] = r->cells.n;
+            wb_u8(&r->cells, 0);
+            continue;
+        }
         q = rd_make(r->ext.p + r->ext_pos, r->ext.n - r->ext_pos);
         n = rd_be32(&q);
         ext = rd_sub(&q, n);

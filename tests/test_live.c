@@ -167,6 +167,89 @@ int main(void)
         CHECK(strcmp(scalar(c, "select count(*) from drda_lob"), "3") == 0);
     }
 
+    /* Parameters: text converted by the server, NULL, a count mismatch. */
+    {
+        drda_param p[3];
+        p[0].data = "5";
+        p[0].len = 1;
+        p[1].data = "Año ñandú";
+        p[1].len = strlen("Año ñandú");
+        p[2].data = NULL;
+        p[2].len = 0;
+        CHECK(drda_query_params(c, "insert into drda_live values (?, ?, ?)", p, 3, &r) == 0);
+        CHECK(drda_rows_affected(r) == 1);
+        drda_free(r);
+        CHECK(drda_query_params(c, "select name, amount from drda_live where id = ?", p, 1,
+                                &r) == 0);
+        CHECK(drda_next(r) == 1 && strcmp(drda_text(r, 0), "Año ñandú") == 0);
+        CHECK(drda_text(r, 1) == NULL);
+        CHECK(drda_next(r) == 0);
+        drda_free(r);
+        CHECK(drda_query_params(c, "select 1 from drda_live where id = ?", p, 2, &r) < 0);
+        CHECK(strstr(drda_error(c), "1 parameter marker") != NULL);
+        p[0].data = "not a number";
+        p[0].len = strlen("not a number");
+        CHECK(drda_query_params(c, "select 1 from drda_live where id = ?", p, 1, &r) < 0);
+        CHECK(drda_sqlcode(c) < 0); /* the server's conversion error */
+        CHECK(run(c, "delete from drda_live where id = 5") == 0);
+    }
+
+    /* An SQL text over 32 KB is refused before it reaches the server. */
+    {
+        char *sql = (char *)malloc(40001);
+        memset(sql, ' ', 40000);
+        memcpy(sql, "select 1 from systables", 23);
+        sql[40000] = 0;
+        CHECK(drda_query(c, sql, &r) < 0 && strstr(drda_error(c), "32000") != NULL);
+        free(sql);
+        CHECK(strcmp(scalar(c, "select id from drda_live"), "3") == 0);
+    }
+
+    /* TEXT and BYTE written through parameters, small and over 32 KB. */
+    CHECK(run(c, "create temp table drda_lobw (id int, tx text, by byte) with no log") == 0);
+    {
+        size_t sizes[] = {0, 5, 100000}, k;
+        int s;
+        for (s = 0; s < 3; s++) {
+            size_t len = sizes[s];
+            char *tx = (char *)malloc(len + 1);
+            unsigned char *by = (unsigned char *)malloc(len + 1);
+            char id[8];
+            drda_param p[3];
+            for (k = 0; k < len; k++) {
+                tx[k] = "abcdefghij"[k % 10];
+                by[k] = (unsigned char)(k * 7 % 256);
+            }
+            snprintf(id, sizeof id, "%d", s);
+            p[0].data = id;
+            p[0].len = strlen(id);
+            p[1].data = tx;
+            p[1].len = len;
+            p[2].data = by;
+            p[2].len = len;
+            CHECK(drda_query_params(c, "insert into drda_lobw values (?, ?, ?)", p, 3, &r) == 0);
+            drda_free(r);
+            CHECK(drda_query_params(c, "select tx, by from drda_lobw where id = ?", p, 1, &r) == 0);
+            CHECK(drda_next(r) == 1);
+            if (drda_text(r, 0) && drda_text(r, 1)) {
+                int ok = strlen(drda_text(r, 0)) == len && strlen(drda_text(r, 1)) == 2 * len &&
+                         memcmp(drda_text(r, 0), tx, len) == 0;
+                for (k = 0; ok && k < len; k++) {
+                    char hx[3];
+                    snprintf(hx, sizeof hx, "%02x", by[k]);
+                    ok = memcmp(drda_text(r, 1) + 2 * k, hx, 2) == 0;
+                }
+                CHECK(ok);
+            } else {
+                CHECK(len == 0); /* Informix may store an empty large object as NULL */
+            }
+            drda_free(r);
+            free(tx);
+            free(by);
+        }
+    }
+    CHECK(run(c, "drop table drda_lobw") == 0);
+
     CHECK(drda_query(c, "select 1 from drda_live where name = '\xff'", &r) < 0);
     CHECK(strstr(drda_error(c), "UTF-8") != NULL);
 
