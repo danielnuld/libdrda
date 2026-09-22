@@ -158,14 +158,45 @@ int main(void)
     CHECK(atoi(scalar(c, "select count(*) from syscolumns c, systables t "
                          "where c.tabid = t.tabid")) == n);
 
+    /* Several results open at once: a cursor paged across blocks while other
+     * statements run in between, as Squaero pages a grid. */
+    {
+        drda_result *r2;
+        int m = 0, rc2;
+        CHECK(drda_query(c, "select tabname, colname, colno from syscolumns c, systables t "
+                            "where c.tabid = t.tabid", &r) == 0);
+        while (m < 700 && drda_next(r) == 1)
+            m++; /* partway, past the first block */
+        CHECK(drda_query(c, "select tabname from systables order by tabid", &r2) == 0);
+        CHECK(drda_next(r2) == 1 && strcmp(drda_text(r2, 0), "systables") == 0);
+        CHECK(run(c, "update drda_live set name = 'x' where id = 3") == 0);
+        while ((rc2 = drda_next(r2)) == 1)
+            ;
+        CHECK(rc2 == 0);
+        drda_free(r2);
+        while (drda_next(r) == 1)
+            m++;
+        CHECK(m == n); /* nothing lost or repeated around the interleaving */
+        drda_free(r);
+
+        /* A commit while a cursor is open keeps it open (cursors are held:
+         * package SYSSH200), so a caller can commit each statement. */
+        m = 0;
+        CHECK(drda_query(c, "select tabname, colname, colno from syscolumns c, systables t "
+                            "where c.tabid = t.tabid", &r) == 0);
+        while (m < 700 && drda_next(r) == 1)
+            m++;
+        CHECK(run(c, "update drda_live set name = 'y' where id = 3") == 0);
+        CHECK(drda_commit(c) == 0);
+        while (drda_next(r) == 1)
+            m++;
+        CHECK(m == n);
+        drda_free(r);
+    }
+
     /* A result abandoned early closes its cursor; the next query works. */
     CHECK(drda_query(c, "select tabname from systables", &r) == 0);
     CHECK(drda_next(r) == 1);
-    {
-        drda_result *r2;
-        CHECK(drda_query(c, "select 1 from systables", &r2) < 0); /* one open result */
-        CHECK(r2 == NULL);
-    }
     drda_free(r);
     CHECK(strcmp(scalar(c, "select id from drda_live"), "3") == 0);
 

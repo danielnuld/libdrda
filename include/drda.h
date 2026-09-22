@@ -64,7 +64,8 @@ const char *drda_sqlstate(const drda_conn *c);
 
 /* Run any statement. A statement that returns rows yields a result with
  * columns to fetch; any other runs to completion and reports
- * drda_rows_affected(). Only one result may be open per connection. */
+ * drda_rows_affected(). Up to 64 results may be open on a connection at
+ * once, each fetched independently; free them all before drda_close. */
 int drda_query(drda_conn *c, const char *sql, drda_result **out);
 
 /* A value for a `?` marker. data NULL = SQL NULL. Text is UTF-8 and the

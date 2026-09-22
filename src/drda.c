@@ -79,7 +79,7 @@ struct drda_conn {
      * atomic would be stricter but MSVC's C mode lacks <stdatomic.h>. */
     volatile int lost;      /* the stream is unusable (drda_conn_lost) */
     volatile int cancelled; /* drda_cancel cut it */
-    drda_result *open;
+    uint64_t sections; /* package sections in use: bit i = section 65 + i */
     wb in;      /* payload bytes of the current reply chain */
     obj *objs;
     int nobj, capobj;
@@ -87,6 +87,7 @@ struct drda_conn {
 
 struct drda_result {
     drda_conn *c;
+    int section; /* its statement's package section: one per open result */
     dcol *cols;
     int ncols;
     wb data;    /* QRYDTA bytes not decoded yet start at data.p + pos */
@@ -473,7 +474,12 @@ static int check_obj(drda_conn *c, int i)
 
 /* ---- requests ------------------------------------------------------ */
 
-static void pkgnamcsn(wb *w, const drda_conn *c)
+/* Each result keeps its statement in a section of its own, so several can
+ * be open on one connection (a cursor paged while other queries run). */
+#define FIRST_SECTION 65
+#define MAX_OPEN 64
+
+static void pkgnamcsn(wb *w, const drda_conn *c, int section)
 {
     uint8_t b[64];
     memset(b, 0x40, 54);
@@ -481,8 +487,8 @@ static void pkgnamcsn(wb *w, const drda_conn *c)
     to_ebcdic(b + 18, "NULLID", 6);
     to_ebcdic(b + 36, "SYSSH200", 8);
     to_ebcdic(b + 54, "SYSLVL01", 8);
-    b[62] = 0;
-    b[63] = 65; /* section number */
+    b[62] = (uint8_t)(section >> 8);
+    b[63] = (uint8_t)section;
     ddm_bytes(w, PKGNAMCSN, b, 64);
 }
 
@@ -701,8 +707,6 @@ void drda_close(drda_conn *c)
 {
     if (!c)
         return;
-    if (c->open)
-        drda_free(c->open);
 #ifdef DRDA_HAVE_OPENSSL
     if (c->ssl)
         SSL_free(c->ssl);
@@ -849,8 +853,6 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
     c->err[0] = 0;
     c->sqlcode = 0;
     memcpy(c->sqlstate, "00000", 6);
-    if (c->open)
-        return fail(c, "another result is still open on this connection");
     if (!utf8_valid((const uint8_t *)sql, n))
         return fail(c, "the SQL text is not valid UTF-8");
     if (n > 32000) /* its object must fit one DSS segment */
@@ -861,6 +863,14 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
     if (!r)
         return fail(c, "out of memory");
     r->c = c;
+    for (i = 0; i < MAX_OPEN && (c->sections >> i & 1); i++)
+        ;
+    if (i == MAX_OPEN) {
+        free(r);
+        return fail(c, "too many open results on this connection (%d)", MAX_OPEN);
+    }
+    c->sections |= (uint64_t)1 << i;
+    r->section = FIRST_SECTION + i;
     wb_init(&r->data);
     wb_init(&r->cells);
     wb_init(&r->ext);
@@ -869,7 +879,7 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
      * descriptions too when there are values to send. */
     wb_init(&w);
     dss_begin(&w, DSS_RQS, 1, PRPSQLSTT);
-    pkgnamcsn(&w, c);
+    pkgnamcsn(&w, c, r->section);
     ddm_u8(&w, RTNSQLDA, 0xF1);
     dss_end(&w);
     dss_begin(&w, DSS_OBJ, 1, SQLSTT);
@@ -880,7 +890,7 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
     dss_end(&w);
     if (nparams > 0) {
         dss_begin(&w, DSS_RQS, 2, DSCSQLSTT);
-        pkgnamcsn(&w, c);
+        pkgnamcsn(&w, c, r->section);
         ddm_u8(&w, TYPSQLDA, 1); /* input */
         dss_end(&w);
     }
@@ -912,7 +922,7 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
     if (r->ncols == 0) {
         /* Not a query: run it. */
         dss_begin(&w, DSS_RQS, 1, EXCSQLSTT);
-        pkgnamcsn(&w, c);
+        pkgnamcsn(&w, c, r->section);
         ddm_u8(&w, RDBCMTOK, 0xF1);
         dss_end(&w);
         if (put_params(c, &w, pd, params, nparams) < 0) {
@@ -944,7 +954,7 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
 
     /* A query: open a cursor. */
     dss_begin(&w, DSS_RQS, 1, OPNQRY);
-    pkgnamcsn(&w, c);
+    pkgnamcsn(&w, c, r->section);
     ddm_u32(&w, QRYBLKSZ, BLOCK_SIZE);
     ddm_u16(&w, MAXBLKEXT, 0);
     ddm_u8(&w, QRYCLSIMP, 0x01);
@@ -969,14 +979,12 @@ int drda_query_params(drda_conn *c, const char *sql, const drda_param *params, i
         goto fail;
     }
     free_cols(pd, npd);
-    c->open = r;
     *out = r;
     return 0;
 
 fail:
     free_cols(pd, npd);
-    c->open = r; /* let drda_free close the cursor if it got opened */
-    drda_free(r);
+    drda_free(r); /* closes the cursor if it got opened */
     return -1;
 }
 
@@ -1000,7 +1008,7 @@ static int cntqry(drda_result *r)
     wb w;
     wb_init(&w);
     dss_begin(&w, DSS_RQS, 1, CNTQRY);
-    pkgnamcsn(&w, c);
+    pkgnamcsn(&w, c, r->section);
     ddm_u32(&w, QRYBLKSZ, BLOCK_SIZE);
     ddm_u64(&w, QRYINSID, r->qryinsid);
     ddm_u8(&w, RTNEXTDTA, 0x02); /* large objects of every row in the block */
@@ -1101,18 +1109,18 @@ void drda_free(drda_result *r)
     if (!r)
         return;
     c = r->c;
-    if (c->open == r) {
+    {
         if (!r->ended && r->qryinsid) {
             wb w;
             wb_init(&w);
             dss_begin(&w, DSS_RQS, 1, CLSQRY);
-            pkgnamcsn(&w, c);
+            pkgnamcsn(&w, c, r->section);
             ddm_u64(&w, QRYINSID, r->qryinsid);
             dss_end(&w);
             if (send_wb(c, &w) == 0)
                 read_chain(c); /* errors closing are not the caller's */
         }
-        c->open = NULL;
+        c->sections &= ~((uint64_t)1 << (r->section - FIRST_SECTION));
     }
     free_cols(r->cols, r->ncols);
     wb_free(&r->data);

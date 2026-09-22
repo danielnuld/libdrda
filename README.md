@@ -36,7 +36,10 @@ against an Informix 11.70.FC7 server:
 - `?` parameters (`drda_query_params`): values travel as text and the server
   converts them to the column type; TEXT and BYTE of any size are sent as
   large objects.
-- Commit and rollback.
+- Commit and rollback. Up to 64 results open at once on one connection, each
+  paged independently; a commit leaves open cursors open (they are held).
+- `drda_cancel` stops a running query from another thread by cutting the
+  connection; `drda_conn_lost` tells a lost connection from an SQL error.
 - Types: SMALLINT, INTEGER, BIGINT, INT8, SERIAL, FLOAT, SMALLFLOAT, DECIMAL,
   MONEY, CHAR, VARCHAR, LVARCHAR, NCHAR, NVARCHAR, DATE, DATETIME, TEXT,
   BYTE and NULL. Values come back as UTF-8 text; BYTE as hexadecimal.
@@ -59,6 +62,9 @@ Each one fails with an explicit error, never silently:
 - Not tested yet against Informix 12.10, nor writes against 11.70.
 
 Quirks of Informix over DRDA, shown as they arrive:
+
+- In a database without a transaction log every statement is committed as it
+  runs, and `drda_commit` fails with SQLCODE -256 (transaction not available).
 
 - BOOLEAN arrives as SMALLINT (1/0).
 - DATETIME HOUR TO MINUTE shows seconds, and fractions show six digits.
