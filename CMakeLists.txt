@@ -10,6 +10,9 @@ option(DRDA_BUILD_TESTS "Build the tests" ON)
 option(DRDA_WITH_OPENSSL "TLS through OpenSSL" ON)
 
 if(MSVC)
+  # getenv, sscanf and friends are standard C; MSVC's "use the _s variant"
+  # deprecations would otherwise fail the -Werror build.
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
   set(DRDA_WARN /W4)
   if(DRDA_WERROR)
     list(APPEND DRDA_WARN /WX)
